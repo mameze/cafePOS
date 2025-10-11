@@ -39,6 +39,8 @@ func RegisterRoutes(app *fiber.App) {
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Server running 🚀")
 	})
+	app.Get("/api/cakes", handlers.GetCakes)
+	app.Post("/api/cakes", handlers.CreateCake)
 
 	app.Get("/api/receipts", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
