@@ -11,6 +11,7 @@ import (
 	"github.com/jung-kurt/gofpdf"
 )
 
+// Input structure for creating receipts
 type ReceiptRequest struct {
 	CustomerName string `json:"customer_name"`
 	Items        []struct {
@@ -20,7 +21,7 @@ type ReceiptRequest struct {
 	} `json:"items"`
 }
 
-func GenerateReceipt(c *fiber.Ctx) error {
+func CreateReceipt(c *fiber.Ctx) error {
 	var req ReceiptRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -93,6 +94,27 @@ func GenerateReceipt(c *fiber.Ctx) error {
 		"message": "Receipt generated successfully",
 		"receipt": receipt,
 	})
+}
+
+func GetReceipts(c *fiber.Ctx) error {
+	var receipts []models.Receipt
+	if err := config.DB.Preload("Items").Find(&receipts).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch receipts",
+		})
+	}
+	return c.JSON(receipts)
+}
+
+func GetReceiptByID(c *fiber.Ctx) error {
+	id := c.Params("id")
+	var receipt models.Receipt
+	if err := config.DB.Preload("Items").First(&receipt, id).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Receipt not found",
+		})
+	}
+	return c.JSON(receipt)
 }
 
 func generateReceiptPDF(filePath string, receipt models.Receipt) error {

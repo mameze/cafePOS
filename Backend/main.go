@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/joho/godotenv"
 )
 
@@ -22,9 +23,13 @@ func main() {
 
 	app := fiber.New()
 
-	RegisterRoutes(app)
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "http://localhost:5173",
+		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
+		AllowHeaders: "Origin, Content-Type, Accept",
+	}))
 
-	app.Post("/api/receipt/generate", handlers.GenerateReceipt)
+	RegisterRoutes(app)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -47,4 +52,5 @@ func RegisterRoutes(app *fiber.App) {
 			"message": "All receipts",
 		})
 	})
+	app.Post("/api/receipts", handlers.CreateReceipt)
 }

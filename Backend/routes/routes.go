@@ -16,7 +16,8 @@ func RegisterRoutes(app *fiber.App) {
 	app.Put("/api/cakes/:id", handlers.UpdateCake)
 	app.Delete("/api/cakes/:id", handlers.DeleteCake)
 
-	app.Get("/api/receipts", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"message": "All receipts"})
-	})
+	app.Get("/api/receipts", handlers.GetReceipts)
+	app.Get("/api/receipts/:id", handlers.GetReceiptByID)
+	app.Post("/api/receipts", handlers.CreateReceipt)
+
 }
