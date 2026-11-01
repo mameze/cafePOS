@@ -8,7 +8,7 @@ import (
 
 func RegisterRoutes(app *fiber.App) {
 	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendString("Server running 🚀")
+		return c.SendString("Server running")
 	})
 
 	app.Get("/api/cakes", handlers.GetCakes)
@@ -17,7 +17,7 @@ func RegisterRoutes(app *fiber.App) {
 	app.Delete("/api/cakes/:id", handlers.DeleteCake)
 
 	app.Get("/api/receipts", handlers.GetReceipts)
+	app.Get("/api/receipts/next-number", handlers.GetNextReceiptNo) // must stay above ":id"
 	app.Get("/api/receipts/:id", handlers.GetReceiptByID)
 	app.Post("/api/receipts", handlers.CreateReceipt)
-
 }

@@ -5,68 +5,109 @@ import (
 	"POSWEB/models"
 	"fmt"
 	"os"
-	"time"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/jung-kurt/gofpdf"
+	"gorm.io/gorm"
 )
 
-// Input structure for creating receipts
+// What the receipt form sends. "items" is optional: leave it out for a normal
+// hand-written receipt, or send it to price the receipt from the cakes table.
 type ReceiptRequest struct {
-	CustomerName string `json:"customer_name"`
-	Items        []struct {
+	CustomerName  string  `json:"customer_name"`
+	Description   string  `json:"description"`
+	TotalAmount   float64 `json:"total_amount"`
+	AmountPaid    float64 `json:"amount_paid"`
+	PaymentStatus string  `json:"payment_status"` // "paid" or "balance"
+	PaymentMethod string  `json:"payment_method"` // "cash", "cheque" or "mpesa"
+	Items         []struct {
 		CakeCategory string `json:"cake_category"`
 		CakeSize     string `json:"cake_size"`
 		Quantity     int    `json:"quantity"`
 	} `json:"items"`
 }
 
+func receiptError(c *fiber.Ctx, status int, msg string) error {
+	return c.Status(status).JSON(fiber.Map{"error": msg})
+}
+
 func CreateReceipt(c *fiber.Ctx) error {
 	var req ReceiptRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid request",
-		})
+		return receiptError(c, fiber.StatusBadRequest, "Invalid request. Amounts must be numbers.")
 	}
 
-	if len(req.Items) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "No items provided",
-		})
+	name := strings.TrimSpace(req.CustomerName)
+	if name == "" {
+		return receiptError(c, fiber.StatusBadRequest, "Enter who the payment was received from")
+	}
+	description := strings.TrimSpace(req.Description)
+
+	method, err := NormalizeMethod(req.PaymentMethod)
+	if err != nil {
+		return receiptError(c, fiber.StatusBadRequest, err.Error())
 	}
 
-	var total float64
+	total := req.TotalAmount
 	var receiptItems []models.ReceiptItem
 
-	for _, item := range req.Items {
-		var cake models.Cake
-		if err := config.DB.
-			Where("category = ? AND size = ?", item.CakeCategory, item.CakeSize).
-			First(&cake).Error; err != nil {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-				"error": "Cake not found: " + item.CakeCategory + " (" + item.CakeSize + ")",
+	if len(req.Items) > 0 {
+		total = 0
+		var parts []string
+		for _, item := range req.Items {
+			if item.Quantity <= 0 {
+				return receiptError(c, fiber.StatusBadRequest, "Quantity must be at least 1")
+			}
+			var cake models.Cake
+			if err := config.DB.
+				Where("category = ? AND size = ?", item.CakeCategory, item.CakeSize).
+				First(&cake).Error; err != nil {
+				return receiptError(c, fiber.StatusNotFound,
+					"Cake not found: "+item.CakeCategory+" ("+item.CakeSize+")")
+			}
+			subtotal := float64(cake.Price) * float64(item.Quantity)
+			total += subtotal
+			receiptItems = append(receiptItems, models.ReceiptItem{
+				CakeCategory: cake.Category,
+				CakeSize:     cake.Size,
+				Quantity:     item.Quantity,
+				Price:        float64(cake.Price),
+				Subtotal:     subtotal,
 			})
+			parts = append(parts, fmt.Sprintf("%dx %s (%s)", item.Quantity, cake.Category, cake.Size))
 		}
+		if description == "" {
+			description = strings.Join(parts, ", ")
+		}
+	} else if description == "" {
+		return receiptError(c, fiber.StatusBadRequest, "Enter what the payment is for")
+	}
 
-		subtotal := float64(cake.Price) * float64(item.Quantity)
-		total += subtotal
-
-		receiptItems = append(receiptItems, models.ReceiptItem{
-			CakeCategory: cake.Category,
-			CakeSize:     cake.Size,
-			Quantity:     item.Quantity,
-			Price:        float64(cake.Price),
-			Subtotal:     subtotal,
-		})
+	pay, err := ResolvePayment(total, req.AmountPaid, req.PaymentStatus)
+	if err != nil {
+		return receiptError(c, fiber.StatusBadRequest, err.Error())
 	}
 
 	receipt := models.Receipt{
-		CustomerName: req.CustomerName,
-		TotalAmount:  total,
-		Items:        receiptItems,
+		CustomerName:  name,
+		Description:   description,
+		TotalAmount:   pay.Total,
+		AmountPaid:    pay.Paid,
+		Balance:       pay.Balance,
+		PaymentStatus: pay.Status,
+		PaymentMethod: method,
+		Items:         receiptItems,
 	}
 
-	if err := config.DB.Create(&receipt).Error; err != nil {
+	// Save and number the receipt together, so a number is never left blank.
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&receipt).Error; err != nil {
+			return err
+		}
+		receipt.ReceiptNo = FormatReceiptNo(receipt.ID)
+		return tx.Model(&receipt).Update("receipt_no", receipt.ReceiptNo).Error
+	})
+	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "Failed to save receipt",
 			"details": err.Error(),
@@ -74,21 +115,25 @@ func CreateReceipt(c *fiber.Ctx) error {
 	}
 
 	pdfDir := "receipts"
-	if _, err := os.Stat(pdfDir); os.IsNotExist(err) {
-		os.Mkdir(pdfDir, 0755)
+	if err := os.MkdirAll(pdfDir, 0755); err != nil {
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"message": "Receipt saved, but the receipts folder could not be created",
+			"warning": err.Error(),
+			"receipt": receipt,
+		})
 	}
 
-	filePath := fmt.Sprintf("%s/receipt_%d.pdf", pdfDir, receipt.ID)
-	err := generateReceiptPDF(filePath, receipt)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error":   "Failed to generate PDF",
-			"details": err.Error(),
+	filePath := fmt.Sprintf("%s/%s.pdf", pdfDir, receipt.ReceiptNo)
+	if err := generateReceiptPDF(filePath, receipt); err != nil {
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"message": "Receipt saved, but the PDF could not be created",
+			"warning": err.Error(),
+			"receipt": receipt,
 		})
 	}
 
 	receipt.PDFPath = filePath
-	config.DB.Save(&receipt)
+	config.DB.Model(&receipt).Update("pdf_path", filePath)
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"message": "Receipt generated successfully",
@@ -96,12 +141,19 @@ func CreateReceipt(c *fiber.Ctx) error {
 	})
 }
 
+// GetNextReceiptNo lets the form show "Next receipt: JC-0008" before saving.
+func GetNextReceiptNo(c *fiber.Ctx) error {
+	var maxID uint
+	if err := config.DB.Model(&models.Receipt{}).Select("COALESCE(MAX(id), 0)").Scan(&maxID).Error; err != nil {
+		return receiptError(c, fiber.StatusInternalServerError, "Could not work out the next receipt number")
+	}
+	return c.JSON(fiber.Map{"next_receipt_no": FormatReceiptNo(maxID + 1)})
+}
+
 func GetReceipts(c *fiber.Ctx) error {
 	var receipts []models.Receipt
-	if err := config.DB.Preload("Items").Find(&receipts).Error; err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to fetch receipts",
-		})
+	if err := config.DB.Preload("Items").Order("id DESC").Find(&receipts).Error; err != nil {
+		return receiptError(c, fiber.StatusInternalServerError, "Failed to fetch receipts")
 	}
 	return c.JSON(receipts)
 }
@@ -110,49 +162,7 @@ func GetReceiptByID(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var receipt models.Receipt
 	if err := config.DB.Preload("Items").First(&receipt, id).Error; err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "Receipt not found",
-		})
+		return receiptError(c, fiber.StatusNotFound, "Receipt not found")
 	}
 	return c.JSON(receipt)
-}
-
-func generateReceiptPDF(filePath string, receipt models.Receipt) error {
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-
-	pdf.SetFont("Arial", "B", 16)
-	pdf.Cell(190, 10, "Bakery Sales Receipt")
-	pdf.Ln(12)
-
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(190, 8, fmt.Sprintf("Customer: %s", receipt.CustomerName))
-	pdf.Ln(8)
-	pdf.Cell(190, 8, fmt.Sprintf("Date: %s", time.Now().Format("02 Jan 2006 15:04")))
-	pdf.Ln(10)
-
-	pdf.SetFont("Arial", "B", 12)
-	pdf.Cell(60, 8, "Cake Category")
-	pdf.Cell(40, 8, "Size")
-	pdf.Cell(25, 8, "Qty")
-	pdf.Cell(30, 8, "Price")
-	pdf.Cell(30, 8, "Subtotal")
-	pdf.Ln(8)
-
-	pdf.SetFont("Arial", "", 12)
-	for _, item := range receipt.Items {
-		pdf.Cell(60, 8, item.CakeCategory)
-		pdf.Cell(40, 8, item.CakeSize)
-		pdf.Cell(25, 8, fmt.Sprintf("%d", item.Quantity))
-		pdf.Cell(30, 8, fmt.Sprintf("%.2f", item.Price))
-		pdf.Cell(30, 8, fmt.Sprintf("%.2f", item.Subtotal))
-		pdf.Ln(8)
-	}
-
-	pdf.Ln(5)
-	pdf.SetFont("Arial", "B", 13)
-	pdf.Cell(155, 10, "Total:")
-	pdf.Cell(30, 10, fmt.Sprintf("Ksh %.2f", receipt.TotalAmount))
-
-	return pdf.OutputFileAndClose(filePath)
 }
